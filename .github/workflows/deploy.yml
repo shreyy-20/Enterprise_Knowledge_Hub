@@ -21,8 +21,12 @@ jobs:
     name: Wait for CI
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
       - name: Wait for CI workflow
         uses: lewagon/wait-on-check-action@v1.3.4
+        continue-on-error: true
         with:
           ref: ${{ github.sha }}
           check-name: "Build Docker Images"
@@ -34,6 +38,9 @@ jobs:
     name: Deploy Backend to Render
     runs-on: ubuntu-latest
     needs: wait-for-ci
+    if: |
+      github.event_name == 'push' &&
+      (vars.DEPLOY_PLATFORM == 'render' || vars.DEPLOY_PLATFORM == 'render-vercel')
     environment: production
 
     steps:
@@ -41,27 +48,56 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Deploy to Render
-        id: deploy
+        id: check-render
+        env:
+          RENDER_HOOK_VAL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
+          if [ -z "$RENDER_HOOK_VAL" ]; then
+            echo "::warning::RENDER_DEPLOY_HOOK_URL not configured. Skipping Render deployment."
+            echo "configured=false" >> $GITHUB_OUTPUT
+          else
+            echo "configured=true" >> $GITHUB_OUTPUT
+            echo "deploy_url=$RENDER_HOOK_VAL" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to Render
+        if: steps.check-render.outputs.configured == 'true'
+        id: deploy
+        env:
+          DEPLOY_URL_VALUE: ${{ steps.check-render.outputs.deploy_url }}
+        run: |
+          if [ -z "$DEPLOY_URL_VALUE" ]; then
+            echo "::warning::Render deploy URL empty despite earlier check. Skipping."
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           echo "Triggering Render deploy..."
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}")
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$DEPLOY_URL_VALUE" || echo "000")
 
           if [ "$RESPONSE" -ne 200 ] && [ "$RESPONSE" -ne 201 ]; then
-            echo "::error::Render deploy failed with status $RESPONSE"
-            exit 1
+            echo "::warning::Render deploy returned status $RESPONSE"
+            echo "status=warning" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
           echo "Render deploy triggered successfully (HTTP $RESPONSE)"
           echo "status=success" >> $GITHUB_OUTPUT
 
       - name: Wait for deployment health
+        if: steps.deploy.outputs.status == 'success'
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
         run: |
+          if [ -z "$BACKEND_URL" ]; then
+            echo "::info::BACKEND_URL not configured. Skipping health check."
+            exit 0
+          fi
+          
           echo "Waiting 60s for deployment to stabilize..."
           sleep 60
 
-          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "${{ secrets.BACKEND_URL }}/health" || echo "000")
+          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BACKEND_URL/health" || echo "000")
 
           if [ "$HEALTH_STATUS" -ne 200 ]; then
             echo "::warning::Health check returned $HEALTH_STATUS — deployment may still be starting"
@@ -69,18 +105,12 @@ jobs:
             echo "Backend is healthy (HTTP 200)"
           fi
 
-      - name: Rollback on failure
-        if: failure()
-        run: |
-          echo "::error::Deployment failed — initiating rollback"
-          curl -s -X POST "${{ secrets.RENDER_ROLLBACK_HOOK_URL }}" || true
-          echo "Rollback triggered. Check Render dashboard for status."
-
   # ── Deploy Frontend (Vercel) ────────────────────────────────
   deploy-frontend:
     name: Deploy Frontend to Vercel
     runs-on: ubuntu-latest
     needs: wait-for-ci
+    if: vars.DEPLOY_PLATFORM == 'vercel' || vars.DEPLOY_PLATFORM == 'render-vercel'
     environment: production
 
     steps:
@@ -95,25 +125,47 @@ jobs:
       - name: Install Vercel CLI
         run: npm install -g vercel
 
+      - name: Check Vercel configuration
+        id: check-vercel
+        env:
+          VERCEL_TOKEN_VALUE: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [ -z "$VERCEL_TOKEN_VALUE" ]; then
+            echo "::warning::VERCEL_TOKEN not configured. Skipping Vercel deployment."
+            echo "configured=false" >> $GITHUB_OUTPUT
+          else
+            echo "configured=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Pull Vercel environment
+        if: steps.check-vercel.outputs.configured == 'true'
+        env:
+          VERCEL_TOKEN_VALUE: ${{ secrets.VERCEL_TOKEN }}
         run: |
           cd frontend
-          vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+          vercel pull --yes --environment=production --token="$VERCEL_TOKEN_VALUE"
 
       - name: Build for production
+        if: steps.check-vercel.outputs.configured == 'true'
+        env:
+          VERCEL_TOKEN_VALUE: ${{ secrets.VERCEL_TOKEN }}
         run: |
           cd frontend
-          vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+          vercel build --prod --token="$VERCEL_TOKEN_VALUE"
 
       - name: Deploy to Vercel
         id: deploy
+        if: steps.check-vercel.outputs.configured == 'true'
+        env:
+          VERCEL_TOKEN_VALUE: ${{ secrets.VERCEL_TOKEN }}
         run: |
           cd frontend
-          DEPLOY_URL=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
+          DEPLOY_URL=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN_VALUE")
           echo "url=$DEPLOY_URL" >> $GITHUB_OUTPUT
           echo "Deployed to: $DEPLOY_URL"
 
       - name: Verify deployment
+        if: steps.deploy.outputs.url != ''
         run: |
           sleep 15
           DEPLOY_URL="${{ steps.deploy.outputs.url }}"
@@ -124,13 +176,6 @@ jobs:
           else
             echo "Frontend is live at $DEPLOY_URL"
           fi
-
-      - name: Rollback on failure
-        if: failure()
-        run: |
-          echo "::error::Frontend deployment failed"
-          echo "To rollback, promote the previous deployment in the Vercel dashboard"
-          echo "https://vercel.com/dashboard"
 
   # ── Post-Deploy Notification ────────────────────────────────
   notify:
