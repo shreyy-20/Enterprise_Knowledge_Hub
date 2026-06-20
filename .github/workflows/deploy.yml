@@ -1,0 +1,153 @@
+# ============================================================
+# Enterprise Knowledge Hub — GitHub Actions Deploy Pipeline
+# Deploy to Render (backend) and Vercel (frontend) on main push
+# ============================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Wait for CI ─────────────────────────────────────────────
+  wait-for-ci:
+    name: Wait for CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for CI workflow
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          check-name: "Build Docker Images"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 15
+
+  # ── Deploy Backend (Render) ─────────────────────────────────
+  deploy-backend:
+    name: Deploy Backend to Render
+    runs-on: ubuntu-latest
+    needs: wait-for-ci
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to Render
+        id: deploy
+        run: |
+          echo "Triggering Render deploy..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}")
+
+          if [ "$RESPONSE" -ne 200 ] && [ "$RESPONSE" -ne 201 ]; then
+            echo "::error::Render deploy failed with status $RESPONSE"
+            exit 1
+          fi
+
+          echo "Render deploy triggered successfully (HTTP $RESPONSE)"
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment health
+        run: |
+          echo "Waiting 60s for deployment to stabilize..."
+          sleep 60
+
+          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.BACKEND_URL }}/health" || echo "000")
+
+          if [ "$HEALTH_STATUS" -ne 200 ]; then
+            echo "::warning::Health check returned $HEALTH_STATUS — deployment may still be starting"
+          else
+            echo "Backend is healthy (HTTP 200)"
+          fi
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed — initiating rollback"
+          curl -s -X POST "${{ secrets.RENDER_ROLLBACK_HOOK_URL }}" || true
+          echo "Rollback triggered. Check Render dashboard for status."
+
+  # ── Deploy Frontend (Vercel) ────────────────────────────────
+  deploy-frontend:
+    name: Deploy Frontend to Vercel
+    runs-on: ubuntu-latest
+    needs: wait-for-ci
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel
+
+      - name: Pull Vercel environment
+        run: |
+          cd frontend
+          vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build for production
+        run: |
+          cd frontend
+          vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy to Vercel
+        id: deploy
+        run: |
+          cd frontend
+          DEPLOY_URL=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
+          echo "url=$DEPLOY_URL" >> $GITHUB_OUTPUT
+          echo "Deployed to: $DEPLOY_URL"
+
+      - name: Verify deployment
+        run: |
+          sleep 15
+          DEPLOY_URL="${{ steps.deploy.outputs.url }}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$DEPLOY_URL" || echo "000")
+
+          if [ "$STATUS" -ne 200 ]; then
+            echo "::warning::Frontend returned HTTP $STATUS — may still be propagating"
+          else
+            echo "Frontend is live at $DEPLOY_URL"
+          fi
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "::error::Frontend deployment failed"
+          echo "To rollback, promote the previous deployment in the Vercel dashboard"
+          echo "https://vercel.com/dashboard"
+
+  # ── Post-Deploy Notification ────────────────────────────────
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [deploy-backend, deploy-frontend]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service  | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend  | ${{ needs.deploy-backend.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend | ${{ needs.deploy-frontend.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY

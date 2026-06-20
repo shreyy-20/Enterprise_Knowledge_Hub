@@ -1,0 +1,47 @@
+# ============================================================
+# Enterprise Knowledge Hub — Docker Compose (Development)
+# Overrides for hot-reload and debug logging
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# ============================================================
+
+services:
+  # ── API (Development Mode) ────────────────────────────────
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      target: runtime
+    volumes:
+      - ../backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
+    environment:
+      - DEBUG=true
+      - ENVIRONMENT=development
+      - LOG_LEVEL=debug
+    # Disable health check in dev to avoid noise during restarts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Worker (Development Mode) ─────────────────────────────
+  worker:
+    volumes:
+      - ../backend:/app
+    command: python -m app.workers.ingestion_worker
+    environment:
+      - DEBUG=true
+      - LOG_LEVEL=debug
+
+  # ── Frontend (Development Mode) ───────────────────────────
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    volumes:
+      - ../frontend/src:/app/src
+      - ../frontend/public:/app/public
+    ports:
+      - "3000:80"
